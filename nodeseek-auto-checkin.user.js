@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NodeSeek 增强助手
 // @namespace    https://github.com/weiruankeji2025/weiruan-nodeseek-Sign.in
-// @version      2.6.0
+// @version      2.6.1
 // @description  NodeSeek论坛增强：自动签到 + 交易监控 + 抽奖追踪 + 关键字监控 + 自动翻页
 // @author       weiruankeji2025
 // @match        https://www.nodeseek.com/*
@@ -220,28 +220,67 @@
     const getSidebarVisible = () => getSetting('sidebarVisible', true);
     const setSidebarVisible = (visible) => saveSetting('sidebarVisible', visible);
 
+    const getCollapsedCards = () => {
+        const value = getSetting('collapsedCards', {});
+        return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    };
+
+    const setCardCollapsed = (key, collapsed) => {
+        const states = { ...getCollapsedCards(), [key]: !!collapsed };
+        saveSetting('collapsedCards', states);
+    };
+
+    const normalizeKeywords = (items) => {
+        if (!Array.isArray(items)) return [];
+        const seen = new Set();
+        return items.map(v => String(v ?? '').trim()).filter(v => {
+            if (!v) return false;
+            const key = v.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    };
+
     const getKeywords = () => {
         try {
             const saved = GM_getValue(CONFIG.KEYWORD_KEY);
-            if (saved) return saved;
-        } catch {}
-        return { exact: CONFIG.KEYWORDS_EXACT, fuzzy: CONFIG.KEYWORDS_FUZZY };
+            if (saved && typeof saved === 'object') {
+                return {
+                    exact: normalizeKeywords(saved.exact),
+                    fuzzy: normalizeKeywords(saved.fuzzy)
+                };
+            }
+        } catch (e) {
+            console.warn('[NS助手] 读取关键字设置失败，使用默认值:', e);
+        }
+        return { exact: [...CONFIG.KEYWORDS_EXACT], fuzzy: [...CONFIG.KEYWORDS_FUZZY] };
     };
 
     const saveKeywords = (exact, fuzzy) => {
-        GM_setValue(CONFIG.KEYWORD_KEY, { exact, fuzzy });
+        GM_setValue(CONFIG.KEYWORD_KEY, {
+            exact: normalizeKeywords(exact),
+            fuzzy: normalizeKeywords(fuzzy)
+        });
     };
 
     // ==================== 工具函数 ====================
-    const getToday = () => new Date().toISOString().slice(0, 10);
+    const getToday = () => {
+        const now = new Date();
+        const y = now.getFullYear();
+        const m = String(now.getMonth() + 1).padStart(2, '0');
+        const d = String(now.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+    };
     const hasCheckedIn = () => GM_getValue(CONFIG.STORAGE_KEY) === getToday();
     const notify = (title, text, onclick) => {
         GM_notification({ title, text, timeout: 5000, onclick });
     };
     const extractPostId = (url) => {
         if (!url || typeof url !== 'string') return null;
-        // 只匹配标准帖子链接格式：/post-数字.html 或 /post-数字
-        const match = url.match(/\/post-(\d+)(?:\.html|#|$|\?)/);
+        // NodeSeek 当前常见格式为 /post-帖子ID-页码，同时兼容旧的 /post-ID 和 /post-ID.html。
+        // 例如：/post-740425-1、/post-740425-2、/post-740425、/post-740425.html
+        const match = url.match(/\/post-(\d+)(?:-\d+)?(?:\.html)?(?=$|[/?#])/);
         return match ? match[1] : null;
     };
     const truncate = (str, len) => str && str.length > len ? str.trim().slice(0, len) + '…' : (str || '').trim();
@@ -350,11 +389,14 @@
                 headers['X-CSRF-Token'] = csrfToken;
             }
 
-            const res = await fetch(CONFIG.API_URL, {
+            // NodeSeek 的签到接口使用 random 查询参数。把 random 放在 URL 中，
+            // 避免 Service Worker 将无查询参数的 /api/attendance POST 重定向为 opaqueredirect。
+            const attendanceUrl = new URL(CONFIG.API_URL);
+            attendanceUrl.searchParams.set('random', String(CONFIG.RANDOM_MODE));
+            const res = await fetch(attendanceUrl.toString(), {
                 method: 'POST',
                 headers,
-                credentials: 'include',
-                body: `random=${CONFIG.RANDOM_MODE}`
+                credentials: 'include'
             });
             const data = await res.json();
             if (data.success) {
@@ -372,30 +414,108 @@
         }
     };
 
-    // ==================== 数据获取（优化内存） ====================
-    const fetchPageTitles = async (url) => {
+    // ==================== 数据获取（优先当前DOM + 保留2.6.0请求语义） ====================
+    const extractPostsFromDocument = (doc) => {
+        const posts = [], seen = new Set();
+        if (!doc?.querySelectorAll) return posts;
+
+        // NodeSeek 列表项当前使用 .post-list-item / .post-title 结构。
+        // 优先使用标题链接，找不到时再退回所有包含 /post- 的链接，以兼容旧页面结构。
+        let links = Array.from(doc.querySelectorAll('.post-list-item .post-title a[href*="/post-"]'));
+        if (!links.length) links = Array.from(doc.querySelectorAll('a[href*="/post-"]'));
+
+        for (const link of links) {
+            // 排除助手自身渲染的链接和分页链接，避免把旧结果再次当成页面帖子。
+            if (link.closest('.ns-sidebar') || link.closest('.pagination')) continue;
+
+            const href = link.getAttribute('href') || '';
+            const postId = extractPostId(href);
+            const title = link.textContent?.trim();
+            if (!postId || !title || title.length < 3 || seen.has(postId)) continue;
+
+            seen.add(postId);
+            let absoluteUrl = href;
+            try { absoluteUrl = new URL(href, CONFIG.HOME_URL).href; } catch {}
+            posts.push({ id: postId, title, url: absoluteUrl });
+        }
+
+        return posts;
+    };
+
+    const isCurrentDocumentFor = (url) => {
         try {
+            const target = new URL(url, location.href);
+            if (target.origin !== location.origin || target.pathname !== location.pathname) return false;
+            // 配置 URL 没有查询参数时，允许当前页面带 ?page= / 其它列表参数，仍优先读取现有 DOM。
+            return !target.search || target.search === location.search;
+        } catch {
+            return false;
+        }
+    };
+
+    const fetchPageTitles = async (url, { preferCurrentDom = true } = {}) => {
+        // 对当前正在浏览的页面直接读取DOM。NodeSeek已经完成了正常导航和Cloudflare校验，
+        // 这样比再次发起 fetch 更可靠，也避免2.6.1中 no-store 请求得到空壳HTML的问题。
+        if (preferCurrentDom && isCurrentDocumentFor(url)) {
+            const livePosts = extractPostsFromDocument(document);
+            if (livePosts.length) return livePosts;
+        }
+
+        try {
+            // 保持2.6.0已验证可用的请求方式：不要使用 cache:'no-store'。
             const res = await fetch(url, { credentials: 'include' });
-            if (!res.ok) return [];
+            if (!res.ok) {
+                console.warn(`[NS助手] 获取页面失败: ${url}, HTTP ${res.status}`);
+                return null;
+            }
+
             const html = await res.text();
             const doc = new DOMParser().parseFromString(html, 'text/html');
-            const posts = [], seen = new Set();
-            doc.querySelectorAll('a[href*="/post-"]').forEach(link => {
-                const href = link.getAttribute('href');
-                const postId = extractPostId(href);
-                const title = link.textContent?.trim();
-                if (!postId || !title || title.length < 3 || seen.has(postId)) return;
-                if (link.closest('.pagination')) return;
-                seen.add(postId);
-                posts.push({ id: postId, title, url: href.startsWith('http') ? href : `https://www.nodeseek.com${href}` });
-            });
+            const posts = extractPostsFromDocument(doc);
+
+            // 首页/交易页正常情况下不应完全没有帖子。0条更可能意味着验证页、空壳HTML或结构变化，
+            // 不能再把这种情况误报成“暂无匹配/暂无交易/暂无抽奖”。
+            if (!posts.length) {
+                const candidateLinks = Array.from(doc.querySelectorAll('a[href*="/post-"]'));
+                console.warn('[NS助手] 页面返回成功但未解析到帖子:', {
+                    url,
+                    title: doc.title || '',
+                    htmlLength: html.length,
+                    candidateLinkCount: candidateLinks.length,
+                    sampleHrefs: candidateLinks.slice(0, 5).map(a => a.getAttribute('href'))
+                });
+                return null;
+            }
+
             return posts;
-        } catch { return []; }
+        } catch (e) {
+            console.error('[NS助手] 获取页面异常:', url, e);
+            return null;
+        }
+    };
+
+    // 首页数据只做“正在进行的请求”去重，不做结果缓存。
+    // 这样既避免初始化时抽奖和关键字同时请求首页，又不会缓存一次错误/空结果。
+    let homePostsPromise = null;
+    const fetchHomePosts = async () => {
+        if (isCurrentDocumentFor(CONFIG.HOME_URL)) {
+            return fetchPageTitles(CONFIG.HOME_URL, { preferCurrentDom: true });
+        }
+        if (homePostsPromise) return homePostsPromise;
+
+        const request = fetchPageTitles(CONFIG.HOME_URL, { preferCurrentDom: false });
+        homePostsPromise = request;
+        try {
+            return await request;
+        } finally {
+            if (homePostsPromise === request) homePostsPromise = null;
+        }
     };
 
     // ==================== 交易帖获取 ====================
     const fetchActiveTrades = async () => {
         const posts = await fetchPageTitles(CONFIG.TRADE_URL);
+        if (posts === null) return null;
         const results = [];
         for (const post of posts) {
             if (results.length >= CONFIG.TRADE_COUNT) break;
@@ -423,7 +543,8 @@
     };
 
     const fetchActiveLotteries = async () => {
-        const posts = await fetchPageTitles(CONFIG.HOME_URL);
+        const posts = await fetchHomePosts();
+        if (posts === null) return null;
         const results = [], seen = new Set();
         for (const post of posts) {
             if (results.length >= CONFIG.LOTTERY_COUNT || seen.has(post.id)) continue;
@@ -504,32 +625,67 @@
         if (!CONFIG.KEYWORD_MONITOR_ENABLED) return [];
         const kw = getKeywords();
         if (!kw.exact.length && !kw.fuzzy.length) return [];
-        const posts = await fetchPageTitles(CONFIG.HOME_URL);
+
+        const posts = await fetchHomePosts();
+        if (posts === null) return null;
+
+        const notifiedPosts = getNotifiedPosts();
         const results = [];
         for (const post of posts) {
             const match = matchKeyword(post.title, kw.exact, kw.fuzzy);
             if (match) {
-                results.push({ ...post, matchType: match.type, keyword: match.kw, tag: `${match.type === 'exact' ? '精准' : '模糊'}:${match.kw}`, visited: isVisited(post.id), notified: !!getNotifiedPosts()[post.id] });
+                results.push({
+                    ...post,
+                    matchType: match.type,
+                    keyword: match.kw,
+                    tag: `${match.type === 'exact' ? '精准' : '模糊'}:${match.kw}`,
+                    visited: isVisited(post.id),
+                    notified: !!notifiedPosts[post.id]
+                });
             }
         }
         return results;
     };
 
     let keywordTimer = null;
+    let keywordCheckRunning = false;
+
+    const refreshKeywordCard = (matches) => {
+        if (!sidebarInstance) return;
+        const card = sidebarInstance.querySelector('.ns-card.keyword');
+        if (card) renderKeywordCard(card, matches);
+    };
+
     const startKeywordMonitor = () => {
         if (!CONFIG.KEYWORD_MONITOR_ENABLED || keywordTimer) return;
+
         const check = async () => {
-            const matches = await fetchKeywordMatches();
-            const newMatches = matches.filter(m => !m.notified).slice(0, 3);
-            for (const m of newMatches) {
-                notify(`🔍 ${m.keyword}`, truncate(m.title, 30), () => window.open(m.url, '_blank'));
-                markPostNotified(m.id);
-            }
-            if (newMatches.length && sidebarInstance) {
-                const card = sidebarInstance.querySelector('.ns-card.keyword');
-                if (card) renderKeywordCard(card, await fetchKeywordMatches());
+            if (keywordCheckRunning) return;
+            keywordCheckRunning = true;
+            try {
+                const matches = await fetchKeywordMatches();
+                if (matches === null) {
+                    refreshKeywordCard(null);
+                    return;
+                }
+
+                const newMatches = matches.filter(m => !m.notified).slice(0, 3);
+                for (const m of newMatches) {
+                    notify(`🔍 ${m.keyword}`, truncate(m.title, 30), () => window.open(m.url, '_blank'));
+                    markPostNotified(m.id);
+                    m.notified = true;
+                }
+
+                // 核心修复：UI刷新不再依赖“是否有未通知的新帖子”。
+                refreshKeywordCard(matches);
+            } catch (e) {
+                console.error('[NS助手] 关键字监控异常:', e);
+                refreshKeywordCard(null);
+            } finally {
+                keywordCheckRunning = false;
             }
         };
+
         setTimeout(check, 3000);
         keywordTimer = setInterval(check, CONFIG.KEYWORD_MONITOR_INTERVAL);
     };
@@ -605,7 +761,7 @@
         const scale = getScale();
 
         sidebar.innerHTML = `
-            <div class="ns-card autopage">
+            <div class="ns-card autopage" data-card-key="autopage">
                 <div class="ns-card-header"><span>📄 自动翻页</span><span class="ns-card-toggle">−</span></div>
                 <div class="ns-card-body">
                     <div class="ns-panel">
@@ -624,7 +780,7 @@
                     </div>
                 </div>
             </div>
-            <div class="ns-card settings">
+            <div class="ns-card settings" data-card-key="settings">
                 <div class="ns-card-header"><span>⚙️ 面板设置</span><span class="ns-card-toggle">−</span></div>
                 <div class="ns-card-body">
                     <div class="ns-panel">
@@ -651,15 +807,15 @@
                     </div>
                 </div>
             </div>
-            <div class="ns-card keyword">
+            <div class="ns-card keyword" data-card-key="keyword">
                 <div class="ns-card-header"><span>🔍 关键字监控</span><span class="ns-card-toggle">−</span></div>
                 <div class="ns-card-body"><div class="ns-empty ns-loading">监控中...</div></div>
             </div>
-            <div class="ns-card trade">
+            <div class="ns-card trade" data-card-key="trade">
                 <div class="ns-card-header"><span>💰 最新交易</span><span class="ns-card-toggle">−</span></div>
                 <div class="ns-card-body"><div class="ns-empty ns-loading">加载中...</div></div>
             </div>
-            <div class="ns-card lottery">
+            <div class="ns-card lottery" data-card-key="lottery">
                 <div class="ns-card-header"><span>🎁 最新抽奖</span><span class="ns-card-toggle">−</span></div>
                 <div class="ns-card-body"><div class="ns-empty ns-loading">加载中...</div></div>
             </div>
@@ -667,13 +823,26 @@
 
         document.body.appendChild(sidebar);
 
-        // 卡片折叠
-        sidebar.querySelectorAll('.ns-card-header').forEach(h => {
-            h.onclick = () => {
-                const card = h.closest('.ns-card'), toggle = h.querySelector('.ns-card-toggle');
-                card.classList.toggle('collapsed');
-                toggle.textContent = card.classList.contains('collapsed') ? '+' : '−';
-            };
+        // 卡片折叠：保存状态，刷新页面后保持用户上次的展开/收起选择。
+        const collapsedCards = getCollapsedCards();
+        sidebar.querySelectorAll('.ns-card[data-card-key]').forEach(card => {
+            const key = card.dataset.cardKey;
+            const header = card.querySelector('.ns-card-header');
+            const toggle = header?.querySelector('.ns-card-toggle');
+
+            if (collapsedCards[key]) {
+                card.classList.add('collapsed');
+                if (toggle) toggle.textContent = '+';
+            }
+
+            if (header) {
+                header.onclick = () => {
+                    card.classList.toggle('collapsed');
+                    const collapsed = card.classList.contains('collapsed');
+                    if (toggle) toggle.textContent = collapsed ? '+' : '−';
+                    setCardCollapsed(key, collapsed);
+                };
+            }
         });
 
         // 自动翻页
@@ -692,12 +861,30 @@
         // 关键字保存
         document.getElementById('ns-save-kw').onclick = async e => {
             e.stopPropagation();
-            const parse = s => s.split(/[,，]/).map(x => x.trim()).filter(x => x);
-            saveKeywords(parse(document.getElementById('ns-kw-exact').value), parse(document.getElementById('ns-kw-fuzzy').value));
-            e.target.textContent = '已保存 ✓';
-            const card = sidebar.querySelector('.ns-card.keyword');
-            if (card) renderKeywordCard(card, await fetchKeywordMatches());
-            setTimeout(() => e.target.textContent = '保存关键字', 1500);
+            const button = e.currentTarget;
+            const parse = value => normalizeKeywords(value.split(/[,，]/));
+
+            saveKeywords(
+                parse(document.getElementById('ns-kw-exact').value),
+                parse(document.getElementById('ns-kw-fuzzy').value)
+            );
+
+            button.disabled = true;
+            button.textContent = '保存并刷新中...';
+            try {
+                const matches = await fetchKeywordMatches();
+                refreshKeywordCard(matches);
+                button.textContent = matches === null ? '已保存，获取失败' : '已保存 ✓';
+            } catch (err) {
+                console.error('[NS助手] 保存关键字后刷新失败:', err);
+                refreshKeywordCard(null);
+                button.textContent = '已保存，获取失败';
+            } finally {
+                setTimeout(() => {
+                    button.disabled = false;
+                    button.textContent = '保存关键字';
+                }, 1500);
+            }
         };
 
         sidebarInstance = sidebar;
@@ -705,8 +892,16 @@
     };
 
     const renderKeywordCard = (card, items) => {
+        if (!card) return;
         const body = card.querySelector('.ns-card-body');
-        if (!items?.length) {
+        if (!body) return;
+
+        if (items === null) {
+            body.innerHTML = '<div class="ns-empty">获取失败，稍后自动重试<br><span style="font-size:8px;color:#bbb">F12 Console 可查看原因</span></div>';
+            return;
+        }
+
+        if (!items.length) {
             const kw = getKeywords(), all = [...kw.exact, ...kw.fuzzy].join(', ');
             body.innerHTML = `<div class="ns-empty">暂无匹配<br><span style="font-size:8px;color:#bbb">${truncate(all, 25)}</span></div>`;
             return;
@@ -726,8 +921,11 @@
     };
 
     const renderItemCard = (card, items, emptyText) => {
+        if (!card) return;
         const body = card.querySelector('.ns-card-body');
-        if (!items?.length) { body.innerHTML = `<div class="ns-empty">${emptyText}</div>`; return; }
+        if (!body) return;
+        if (items === null) { body.innerHTML = '<div class="ns-empty">获取失败，稍后重试</div>'; return; }
+        if (!items.length) { body.innerHTML = `<div class="ns-empty">${emptyText}</div>`; return; }
         body.innerHTML = items.map(i => `
             <div class="ns-item ${i.visited?'visited':''}" data-id="${i.id}">
                 <a href="${escapeHtml(i.url)}" target="_blank" title="${escapeHtml(i.title)}">
@@ -752,7 +950,7 @@
 
     // ==================== 初始化 ====================
     const init = async () => {
-        console.log('[NS助手] v2.5.0');
+        console.log('[NS助手] v2.6.3');
         trackCurrentPost();
         markVisitedPostsOnPage();
         const observer = new MutationObserver(markVisitedPostsOnPage);
